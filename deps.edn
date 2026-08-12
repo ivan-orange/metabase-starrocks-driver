@@ -8,4 +8,16 @@
  :aliases
  {:build
   {:deps {io.github.clojure/tools.build {:mvn/version "0.9.6"}}
-   :ns-default build}}}
+   :ns-default build}
+
+  ;; PHASE-2 TEST HARNESS (D-09): the repo's first automated-test path. Runs the
+  ;; pure-logic clojure.test matrix (metabase.driver.starrocks.impersonation-test)
+  ;; via `clojure -X:test` with the Cognitect test-runner (git dep, pinned tag+sha).
+  ;; extra-deps/extra-paths ONLY — the shipped :deps map is left untouched so the
+  ;; driver JAR does not regress. Needs no StarRocks FE (pure string logic).
+  :test
+  {:extra-paths ["test"]
+   :extra-deps  {io.github.cognitect-labs/test-runner
+                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :main-opts   ["-m" "cognitect.test-runner"]
+   :exec-fn     cognitect.test-runner.api/test}}}

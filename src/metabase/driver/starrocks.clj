@@ -10,14 +10,16 @@
   (:require
    [clojure.java.jdbc :as jdbc]
    [clojure.string :as str]
+   [metabase.api.common :as api]
    [metabase.driver :as driver]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.driver.starrocks.impersonation :as impersonation]
    [metabase.util.log :as log])
   (:import
-   (java.sql Connection ResultSet)))
+   (java.sql Connection ResultSet ResultSetMetaData SQLException Statement)))
 
 (set! *warn-on-reflection* true)
 
@@ -44,7 +46,8 @@
                               :datetime-diff                   true
                               :temporal-extract                true
                               :date-arithmetics                true
-                              :advanced-math-expressions       true}]
+                              :advanced-math-expressions       true
+                              :connection-impersonation        true}]   ; IMP-01 (D-01): native surface declared, kept dormant
   (defmethod driver/database-supports? [:starrocks feature] [_ _ _] supported?))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -100,6 +103,174 @@
                      (let [[k v] (str/split pair #"=" 2)]
                        [(keyword k) (or v "")]))))
       base-spec)))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                    Per-User Impersonation — EXECUTE AS runtime path (Phase 4)                                   |
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;;
+;;; When the `enable-impersonation` toggle is ON for a StarRocks database, every
+;;; user query runs under that user's OWN StarRocks identity via a two-seam
+;;; connection-swap (RESEARCH.md § Recommended Architecture):
+;;;
+;;;   Seam A — `driver/execute-reducible-query :starrocks` binds a query-only
+;;;   dynamic flag `*impersonating?*` and delegates to the `:sql-jdbc` parent.
+;;;   Sync / describe-* / can-connect? never call `execute-reducible-query`, so
+;;;   the flag is never set for them → IMP-04 holds structurally (C-01).
+;;;
+;;;   Seam B — `sql-jdbc.execute/do-with-connection-with-options :starrocks`,
+;;;   when the flag is bound AND the toggle is truthy AND the acting user
+;;;   resolves, opens a FRESH non-pooled connection, issues `EXECUTE AS "<user>"
+;;;   WITH NO REVERT` as the literal first statement, asserts the identity, then
+;;;   runs the query and closes the connection (C-03/C-05). Every other path
+;;;   falls through to unmodified pooled `:sql-jdbc` behavior.
+;;;
+;;; DESIGN INVARIANTS (lifted from the Phase-1 spike ns / RESEARCH.md):
+;;; - NEVER pooled: `jdbc/get-connection` on a plain spec, never c3p0.
+;;; - EXECUTE AS is irreversible within a session; `.close()` is the only way to
+;;;   end the WITH NO REVERT scope, so the connection is used ONCE then closed.
+;;; - FAIL LOUDLY: the impersonated branch's only exits are success or a thrown
+;;;   `ex-info` — it NEVER falls through to the base/service account (Pitfall 3).
+
+(defn- query-rows
+  "Run `sql` on an already-open `conn` and return a vector of row vectors (each a
+   vector of column values, in column order). Type-hinted so
+   `*warn-on-reflection*` stays clean."
+  [^Connection conn sql]
+  (with-open [^Statement stmt (.createStatement conn)]
+    (let [^ResultSet rs         (.executeQuery stmt sql)
+          ^ResultSetMetaData md (.getMetaData rs)
+          n                     (.getColumnCount md)]
+      (loop [rows []]
+        (if (.next rs)
+          (recur (conj rows (mapv (fn [i] (.getObject rs (int i)))
+                                  (range 1 (inc n)))))
+          rows)))))
+
+(defn- current-user-of
+  "Return the held-open connection's session identity, verbatim, via
+   `SELECT current_user()` (e.g. \"'alice'@'%'\")."
+  [^Connection conn]
+  (-> (query-rows conn "SELECT current_user()") ffirst str))
+
+(defn- assert-current-user!
+  "Throw LOUDLY unless `conn`'s identity matches `expected` (IMP-05). Never
+   returns a boolean-and-continue: an identity mismatch is a hard stop so the
+   caller can never run a query as the wrong (or base) user. Returns the raw
+   `current_user()` string on success."
+  [^Connection conn expected]
+  (let [raw (current-user-of conn)]
+    ;; WR-03: case-insensitive comparison via the pure impersonation/identity-match?
+    ;; so a non-lowercase current_user() is not spuriously rejected; a genuine
+    ;; mismatch still hard-fails (fail-closed, IMP-05).
+    (when-not (impersonation/identity-match? expected raw)
+      (throw (ex-info "EXECUTE AS identity mismatch — refusing to continue"
+                      {:type :qp/impersonation-identity-mismatch
+                       :expected expected
+                       :actual (impersonation/normalize-user raw)
+                       :actual-raw raw})))
+    raw))
+
+(defn- open-impersonated!
+  "Open a BRAND-NEW non-pooled physical connection from `spec` (built by
+   `connection-details->spec`, D-06) and switch its identity with
+   `EXECUTE AS \"<username>\" WITH NO REVERT` (built by the Phase-2
+   `impersonation/execute-as-sql`, C-06) as the literal FIRST executed statement
+   (IMP-02). Returns the still-open `^Connection` — the CALLER owns it and MUST
+   `.close()` it (closing is the only way to end the WITH NO REVERT scope,
+   IMP-03). On failure closes the half-open connection first, then throws a
+   humanized `ex-info` — ERR-01 (missing IMPERSONATE privilege) or ERR-02
+   (StarRocks < 2.4) via `impersonation/execute-as-error->humanized`, else a
+   generic loud `ex-info`. It NEVER continues as the base account (C-05). The
+   catch wraps ONLY the machine-generated `EXECUTE AS` statement; the user's own
+   query runs later in `(f conn)`, outside this catch, so the broad ERR-02 parse
+   match cannot swallow the user's own query errors (T-04-06)."
+  ^Connection [spec username]
+  (let [^Connection conn (jdbc/get-connection spec)]
+    (try
+      (with-open [^Statement stmt (.createStatement conn)]
+        (.execute stmt (impersonation/execute-as-sql username)))
+      conn
+      (catch Throwable t
+        ;; WR-04: guard the failure-path close so a throwing `.close` (e.g. an
+        ;; already-broken socket — a plausible cause of the EXECUTE AS failure)
+        ;; can never replace the humanized ERR-01/ERR-02 (or generic loud) ex-info
+        ;; the operator needs.
+        (try (.close conn) (catch Throwable _))
+        (if-let [humanized (impersonation/execute-as-error->humanized (str (.getMessage t)))]
+          (throw (ex-info (:message humanized) {:type (:type humanized)} t))
+          (throw (ex-info (str "Impersonation setup failed for StarRocks user "
+                               (pr-str username) ": " (.getMessage t))
+                          {:type :qp/impersonation-setup-failed :username username}
+                          t)))))))
+
+;;; Seam A — query-only marker. Bound true ONLY inside a user query; sync /
+;;; describe-* / can-connect? never traverse `execute-reducible-query`, so this
+;;; stays false for them (C-01, IMP-04).
+(def ^:private ^:dynamic *impersonating?*
+  "True only during a user query on the query-execution thread. Bound by Seam A,
+   read by Seam B on the same thread (synchronous same-thread acquisition)."
+  false)
+
+(defmethod driver/execute-reducible-query :starrocks
+  [driver query context respond]
+  (binding [*impersonating?* true]
+    ((get-method driver/execute-reducible-query :sql-jdbc)
+     driver query context respond)))
+
+;;; Seam B — connection swap. Engages the fresh non-pooled impersonated
+;;; connection ONLY when the query-only flag is bound AND the toggle is truthy.
+;;; D-01: engages on ANY Metabase edition when the toggle is ON (the
+;;; `enable-impersonation` toggle is the single source of truth, C-04); the
+;;; native `:connection-impersonation` feature plays no role in this activation.
+(defmethod sql-jdbc.execute/do-with-connection-with-options :starrocks
+  [driver db-or-id-or-spec options f]
+  (case (impersonation/impersonation-disposition *impersonating?* db-or-id-or-spec)
+    ;; Impersonated path (C-05 engage-or-hard-fail): the ONLY exits from here are
+    ;; success or a thrown ex-info — NEVER a fall-through to the base account.
+    :impersonate
+    (let [email    (:email @api/*current-user*)
+          username (impersonation/derive-username email)]
+      (when-not username
+        ;; WR-01/USR-03: fail loud but PII-free — the acting-user email is NOT
+        ;; placed in ex-data (Metabase logs QP ex-data server-side, and the
+        ;; email adds no diagnostic value the humanized message does not). This
+        ;; mirrors the adjacent :indeterminate throw's non-PII :arg-class choice.
+        (throw (ex-info (str "Impersonation is enabled but your Metabase login does not map to a "
+                             "StarRocks user — cannot determine your StarRocks identity.")
+                        {:type :qp/impersonation-no-identity})))
+      ;; WR-02: debug-level engagement probe carrying only the derived StarRocks
+      ;; username (a non-PII identifier) — never the acting-user email.
+      (log/debugf "[IMPERSONATION] engaging EXECUTE AS as StarRocks user %s" (pr-str username))
+      ;; WR-01: establish the SSH tunnel the same way the connection-test path does
+      ;; (`can-connect?`). The macro applies `metabase.util.ssh`'s tunnel — rewriting
+      ;; host/port to the local tunnel endpoint (a no-op when `ssh-tunnel` is off) —
+      ;; around `connection-details->spec`, and keeps the tunnel open for the whole
+      ;; body. The fresh-non-pooled + EXECUTE-AS-first + single-query + explicit-close
+      ;; invariants (IMP-02/IMP-03, C-03) are preserved because `open-impersonated!`
+      ;; and the `with-open` are unchanged inside the wrapper.
+      (sql-jdbc.conn/with-connection-spec-for-testing-connection [spec [driver (:details db-or-id-or-spec)]]
+        (with-open [^Connection conn (open-impersonated! spec username)]
+          (assert-current-user! conn username)                  ; IMP-05, before the query runs
+          (sql-jdbc.execute/set-default-connection-options! driver db-or-id-or-spec conn options)
+          (f conn))))
+
+    ;; Fail-closed (CR-01, C-05): impersonation is REQUIRED for this query but the
+    ;; toggle cannot be read to prove it is OFF (the arg is an id / a spec lacking
+    ;; :details / nil). We must NOT delegate to the base pooled :sql-jdbc account —
+    ;; that silent fall-through is the exact cross-user leak this guard prevents
+    ;; (Pitfall 3). Hard-fail with a non-PII diagnostic (the arg class, never the
+    ;; email).
+    :indeterminate
+    (throw (ex-info (str "Cannot determine impersonation state for this query — "
+                         "refusing to run as the base StarRocks account.")
+                    {:type     :qp/impersonation-indeterminate
+                     :arg-class (some-> db-or-id-or-spec class .getName)}))
+
+    ;; Pass-through (SC3/IMP-04): toggle-off or non-query paths delegate to the
+    ;; unchanged pooled :sql-jdbc behavior, exactly as the pre-change else-path did.
+    :pass-through
+    ((get-method sql-jdbc.execute/do-with-connection-with-options :sql-jdbc)
+     driver db-or-id-or-spec options f)))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Type Mappings                                                          |

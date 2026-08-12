@@ -27,6 +27,12 @@ driver:
     - user
     - password
     - ssh-tunnel
+    - name: enable-impersonation
+      display-name: Enable per-user impersonation (EXECUTE AS)
+      type: boolean
+      default: false
+      required: false
+      helper-text: "When on, every query runs under the Metabase user's own StarRocks identity via EXECUTE AS. Requires StarRocks 2.4+, Metabase Enterprise/Pro, and the IMPERSONATE privilege on the connection account. See the README 'Per-User Impersonation' setup recipe."
     - advanced-options-start
     - merge:
         - additional-options
